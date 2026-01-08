@@ -51,6 +51,7 @@ async function fetchRankings() {
     name: player.player_name,
     points: player.total,
     rank: player.rank,
+    gwPoints: player.event_total ?? player.event_points ?? player.event_total_points ?? 0,
   }));
 }
 
@@ -74,38 +75,46 @@ function getBiggestMover(newRanks, oldRanks) {
   return biggestMover && maxClimb > 0 ? biggestMover : null;
 }
 
-function buildMessage(newRanks, oldRanks) {
-  let msg = "🏆 FPL League Rankings\n\n";
+function buildMessage(newRanks, oldRanks, gameweek) {
+  function formatMessage(rankings, gameweek) {
+    const leagueSize = rankings.length;
+    const leader = rankings[0];
+    const bottom = rankings[leagueSize - 1];
 
-  newRanks.forEach((p, i) => {
-    let movement = "➖";
+    let msg = `🏆 FPL League Rankings — GW${gameweek}\n`;
+    msg += `👥 (${leagueSize} Managers)\n\n`;
 
-    if (oldRanks) {
-      const old = oldRanks.find(o => o.entry === p.entry);
-      if (old) {
-        if (p.rank < old.rank) movement = `⬆️ +${old.rank - p.rank}`;
-        if (p.rank > old.rank) movement = `⬇️ -${p.rank - old.rank}`;
+      msg += `Current Leader: ${leader.name} (${leader.points} pts)\n\n`;
+
+    rankings.forEach((player, index) => {
+      const rank = index + 1;
+
+      let prefix = `${rank}.`;
+      if (rank === 1) prefix = "🥇";
+      if (rank === 2) prefix = "🥈";
+      if (rank === 3) prefix = "🥉";
+
+      msg += `${prefix} ${player.name} — ${player.points} pts ➖\n`;
+
+      // Separator after 10, 20, 30, 40 (but not after last player)
+      if (rank % 10 === 0 && rank !== leagueSize) {
+        msg += `──────────────\n`;
       }
-    }
+    });
 
-    // Top 3 styling
-    if (i === 0) {
-      msg += `🥇 ${p.name} — ${p.points} pts ${movement}\n`;
-    } else if (i === 1) {
-      msg += `🥈 ${p.name} — ${p.points} pts ${movement}\n`;
-    } else if (i === 2) {
-      msg += `🥉 ${p.name} — ${p.points} pts ${movement}\n`;
-    } else {
-      msg += `${i + 1}. ${p.name} — ${p.points} pts ${movement}\n`;
-    }
-  });
+    msg += `\n⚠️ Bottom of the table: ${bottom.name} (${bottom.points} pts)\n`;
+    msg += `\n📊 Updated automatically`;
+
+    return msg;
+  }
+
+  let msg = formatMessage(newRanks, gameweek);
 
   const biggestMover = getBiggestMover(newRanks, oldRanks);
   if (biggestMover) {
-    msg += `\n🔥 Biggest Climber: ${biggestMover.name} (+${biggestMover.climb})`;
+    msg += `\n\n🔥 Biggest Climber: ${biggestMover.name} (+${biggestMover.climb})`;
   }
 
-  msg += `\n\nUpdated automatically`;
   return msg;
 }
 
@@ -164,12 +173,22 @@ async function checkAndUpdate() {
     const state = loadState();
     const newRanks = await fetchRankings();
     const CURRENT_GAMEWEEK = 23; // update weekly
-    const topScorer = await fetchGameweekTopScorer(CURRENT_GAMEWEEK);
+
+    // Determine GW top scorer from the fetched rankings (requires gwPoints in fetchRankings)
+    let topScorer = null;
+    if (newRanks && newRanks.length) {
+      topScorer = newRanks[0];
+      for (const p of newRanks) {
+        if ((p.gwPoints ?? 0) > (topScorer.gwPoints ?? 0)) {
+          topScorer = p;
+        }
+      }
+    }
 
     if (!state.rankings) {
-      let text = buildMessage(newRanks, null);
-      if (topScorer && typeof topScorer.points === 'number') {
-        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.points} pts`;
+      let text = buildMessage(newRanks, null, CURRENT_GAMEWEEK);
+      if (topScorer && typeof topScorer.gwPoints === 'number') {
+        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.name} (${topScorer.gwPoints} pts)`;
       }
       const messageId = await sendMessage(text);
       saveState({ rankings: newRanks, messageId });
@@ -178,12 +197,12 @@ async function checkAndUpdate() {
     }
 
     if (rankingsChanged(state.rankings, newRanks)) {
-      let text = buildMessage(newRanks, state.rankings);
-      if (topScorer && typeof topScorer.points === 'number') {
-        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.points} pts`;
+      let text = buildMessage(newRanks, state.rankings, CURRENT_GAMEWEEK);
+      if (topScorer && typeof topScorer.gwPoints === 'number') {
+        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.name} (${topScorer.gwPoints} pts)`;
       }
-      await editMessage(text, state.messageId);
-      saveState({ rankings: newRanks, messageId: state.messageId });
+      const messageId = await sendMessage(text);
+      saveState({ rankings: newRanks, messageId });
       console.log("Rankings updated");
     } else {
       console.log("No changes");
