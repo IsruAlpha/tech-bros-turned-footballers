@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 import cron from 'node-cron';
+import http from 'http';
 import fs from 'fs';
 import dotenv from 'dotenv';
 const dotenvResult = dotenv.config({ path: '.env', override: true });
@@ -190,3 +191,12 @@ cron.schedule('*/30 * * * *', checkAndPost);
 
 // Run immediately on start
 checkAndPost();
+
+// Minimal HTTP server for health checks (Koyeb expects port 8000)
+const port = process.env.PORT || 8000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+});
+
+server.listen(port, () => console.log(`Server running on port ${port}`));
