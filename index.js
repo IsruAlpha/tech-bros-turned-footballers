@@ -1,222 +1,192 @@
-import fetch from "node-fetch";
-import cron from "node-cron";
-import fs from "fs";
-import "dotenv/config";
+import { createClient } from '@supabase/supabase-js';
+import fetch from 'node-fetch';
+import cron from 'node-cron';
+import fs from 'fs';
+import dotenv from 'dotenv';
+const dotenvResult = dotenv.config({ path: '.env', override: true });
+console.log('dotenv result:', dotenvResult && dotenvResult.parsed ? Object.keys(dotenvResult.parsed) : dotenvResult);
+
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
+console.log('SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? 'loaded' : 'missing');
+
+// Fallback: if dotenv didn't parse the supabase vars for some reason,
+// try to read and parse `.env` manually and set them on `process.env`.
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+  try {
+    const raw = fs.readFileSync('.env', 'utf8');
+    const lines = raw.split(/\r?\n/);
+    for (const line of lines) {
+      const l = line.trim();
+      if (!l || l.startsWith('#')) continue;
+      const idx = l.indexOf('=');
+      if (idx === -1) continue;
+      const key = l.slice(0, idx).trim();
+      let val = l.slice(idx + 1).trim();
+      if ((key === 'SUPABASE_URL' || key === 'SUPABASE_ANON_KEY') && val) {
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        process.env[key] = val;
+      }
+    }
+    console.log('Fallback supabase loaded:', !!process.env.SUPABASE_URL, !!process.env.SUPABASE_ANON_KEY);
+  } catch (e) {
+    console.error('Fallback .env parse failed:', e && e.message ? e.message : e);
+  }
+}
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const LEAGUE_ID = "1843498"; // fixed league ID
 
-const DATA_FILE = "./state.json";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-const API_URL =
-  "https://fantasy.premierleague.com/api/leagues-classic/1843498/standings/";
-
-async function fetchGameweekTopScorer(gameweek) {
-  const res = await fetch(
-    `https://fantasy.premierleague.com/api/event/${gameweek}/live/`
-  );
-  const data = await res.json();
-
-  let top = { entry: null, points: 0 };
-
-  Object.values(data.elements).forEach(el => {
-    if (el.stats.total_points > top.points) {
-      top = {
-        entry: el.id,
-        points: el.stats.total_points,
-      };
-    }
-  });
-
-  return top;
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error('Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_ANON_KEY in your .env or environment.');
+  process.exit(1);
 }
 
-function loadState() {
-  if (!fs.existsSync(DATA_FILE)) {
-    return { rankings: null, messageId: null };
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-function saveState(state) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
-}
+const API_URL = `https://fantasy.premierleague.com/api/leagues-classic/1843498/standings/`;
 
+// Fetch rankings from FPL API
 async function fetchRankings() {
   const res = await fetch(API_URL);
-  const data = await res.json();
-
-  return data.standings.results.map(player => ({
-    entry: player.entry,
-    name: player.player_name,
-    points: player.total,
-    rank: player.rank,
-    gwPoints: player.event_total ?? player.event_points ?? player.event_total_points ?? 0,
-  }));
+  return res.json();
 }
 
-function getBiggestMover(newRanks, oldRanks) {
-  if (!oldRanks) return null;
+// Load last stored rankings from Supabase
+async function loadLastData() {
+  const { data, error } = await supabase
+    .from('fantasy_rankings')
+    .select('data')
+    .eq('league_id', LEAGUE_ID)
+    .single();
 
-  let biggestMover = null;
-  let maxClimb = 0;
+  if (error && error.code !== 'PGRST116') {
+    console.error('Supabase load error:', error);
+    return null;
+  }
 
-  newRanks.forEach(p => {
-    const old = oldRanks.find(o => o.entry === p.entry);
-    if (!old) return;
+  return data ? data.data : null;
+}
 
-    const climb = old.rank - p.rank;
-    if (climb > maxClimb) {
-      maxClimb = climb;
-      biggestMover = { name: p.name, climb };
+// Save new rankings to Supabase
+async function saveData(newData) {
+  const { error } = await supabase
+    .from('fantasy_rankings')
+    .upsert({
+      league_id: LEAGUE_ID,
+      data: newData,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'league_id' });
+
+  if (error) {
+    console.error('Supabase save error:', error);
+  }
+}
+
+// Check if rankings changed by comparing JSON strings
+function rankingsChanged(oldData, newData) {
+  return JSON.stringify(oldData) !== JSON.stringify(newData);
+}
+
+// Format message to send on Telegram (matching previous style)
+function formatMessage(standings, gameweek, topScorer) {
+  const leagueSize = standings.length;
+  const leader = standings[0];
+  const bottom = standings[leagueSize - 1];
+
+  let msg = `🏆 FPL League Rankings — GW${gameweek}\n`;
+  msg += `👥 (${leagueSize} Managers)\n\n`;
+
+  msg += `Current Leader: ${leader.player_name} (${leader.total} pts)\n\n`;
+
+  standings.forEach((player, i) => {
+    let rankText = '';
+    if (i === 0) rankText = '🥇 ';
+    else if (i === 1) rankText = '🥈 ';
+    else if (i === 2) rankText = '🥉 ';
+    else rankText = `${i + 1}. `;
+
+    msg += `${rankText}${player.player_name} — ${player.total} pts ➖\n`;
+
+    if ([9, 19, 29, 39].includes(i)) {
+      msg += `──────────────\n`;
     }
   });
 
-  return biggestMover && maxClimb > 0 ? biggestMover : null;
-}
+  msg += `\n⚠️ Bottom of the table: ${bottom.player_name} (${bottom.total} pts)\n`;
 
-function buildMessage(newRanks, oldRanks, gameweek) {
-  function formatMessage(rankings, gameweek) {
-    const leagueSize = rankings.length;
-    const leader = rankings[0];
-    const bottom = rankings[leagueSize - 1];
+  const topName = topScorer?.player_name || topScorer?.name || topScorer?.entry_name || 'Unknown';
+  const topPoints = topScorer?.event_points ?? topScorer?.event_total ?? topScorer?.event_total_points ?? 0;
+  msg += `\n🎯 GW${gameweek} Top Scorer: ${topName} (${topPoints} pts)\n`;
 
-    let msg = `🏆 FPL League Rankings — GW${gameweek}\n`;
-    msg += `👥 (${leagueSize} Managers)\n\n`;
-
-      msg += `Current Leader: ${leader.name} (${leader.points} pts)\n\n`;
-
-    rankings.forEach((player, index) => {
-      const rank = index + 1;
-
-      let prefix = `${rank}.`;
-      if (rank === 1) prefix = "🥇";
-      if (rank === 2) prefix = "🥈";
-      if (rank === 3) prefix = "🥉";
-
-      msg += `${prefix} ${player.name} — ${player.points} pts ➖\n`;
-
-      // Separator after 10, 20, 30, 40 (but not after last player)
-      if (rank % 10 === 0 && rank !== leagueSize) {
-        msg += `──────────────\n`;
-      }
-    });
-
-    msg += `\n⚠️ Bottom of the table: ${bottom.name} (${bottom.points} pts)\n`;
-    msg += `\n📊 Updated automatically`;
-
-    return msg;
-  }
-
-  let msg = formatMessage(newRanks, gameweek);
-
-  const biggestMover = getBiggestMover(newRanks, oldRanks);
-  if (biggestMover) {
-    msg += `\n\n🔥 Biggest Climber: ${biggestMover.name} (+${biggestMover.climb})`;
-  }
+  msg += `\n📊 Updated automatically`;
 
   return msg;
 }
 
-async function sendMessage(text) {
-  const res = await fetch(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHANNEL_ID,
-        text,
-      }),
-    }
-  );
-
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}: ${JSON.stringify(data)}`);
+// Fetch current gameweek from bootstrap-static
+async function fetchCurrentGameweek() {
+  try {
+    const res = await fetch('https://fantasy.premierleague.com/api/bootstrap-static/');
+    const data = await res.json();
+    const currentEvent = data.events && data.events.find(e => e.is_current);
+    if (currentEvent) return currentEvent.id;
+    const nextEvent = data.events && data.events.find(e => e.is_next);
+    return nextEvent ? nextEvent.id : 'Unknown';
+  } catch (e) {
+    console.error('Failed to fetch bootstrap-static:', e && e.message ? e.message : e);
+    return 'Unknown';
   }
-
-  if (!data || data.ok === false) {
-    throw new Error(`Telegram API error: ${data && data.description ? data.description : JSON.stringify(data)}`);
-  }
-
-  if (!data.result) {
-    throw new Error(`Unexpected Telegram response, no result: ${JSON.stringify(data)}`);
-  }
-
-  return data.result.message_id;
 }
 
-async function editMessage(text, messageId) {
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+// Send message to Telegram channel
+async function postToTelegram(text) {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: CHANNEL_ID,
-      message_id: messageId,
       text,
+      parse_mode: 'Markdown',
     }),
   });
-
-  const data = await res.json();
-  if (!res.ok || (data && data.ok === false)) {
-    throw new Error(`Failed to edit message: ${res.status} ${res.statusText} - ${JSON.stringify(data)}`);
-  }
 }
 
-function rankingsChanged(oldRanks, newRanks) {
-  return JSON.stringify(oldRanks) !== JSON.stringify(newRanks);
-}
-
-async function checkAndUpdate() {
+async function checkAndPost() {
   try {
-    const state = loadState();
-    const newRanks = await fetchRankings();
-    const CURRENT_GAMEWEEK = 23; // update weekly
+    const newData = await fetchRankings();
+    const standings = newData.standings.results;
+    const gameweek = await fetchCurrentGameweek();
 
-    // Determine GW top scorer from the fetched rankings (requires gwPoints in fetchRankings)
-    let topScorer = null;
-    if (newRanks && newRanks.length) {
-      topScorer = newRanks[0];
-      for (const p of newRanks) {
-        if ((p.gwPoints ?? 0) > (topScorer.gwPoints ?? 0)) {
-          topScorer = p;
-        }
-      }
-    }
+    // Find top scorer for this GW (robust to different field names)
+    let topScorer = standings.reduce((max, player) => {
+      const pPoints = player.event_points ?? player.event_total ?? player.event_total_points ?? 0;
+      const mPoints = max ? (max.event_points ?? max.event_total ?? max.event_total_points ?? 0) : 0;
+      return pPoints > mPoints ? player : max;
+    }, standings[0]);
 
-    if (!state.rankings) {
-      let text = buildMessage(newRanks, null, CURRENT_GAMEWEEK);
-      if (topScorer && typeof topScorer.gwPoints === 'number') {
-        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.name} (${topScorer.gwPoints} pts)`;
-      }
-      const messageId = await sendMessage(text);
-      saveState({ rankings: newRanks, messageId });
-      console.log("Initial rankings posted");
-      return;
-    }
+    const oldData = await loadLastData();
 
-    if (rankingsChanged(state.rankings, newRanks)) {
-      let text = buildMessage(newRanks, state.rankings, CURRENT_GAMEWEEK);
-      if (topScorer && typeof topScorer.gwPoints === 'number') {
-        text += `\n🎯 GW${CURRENT_GAMEWEEK} Top Scorer: ${topScorer.name} (${topScorer.gwPoints} pts)`;
-      }
-      const messageId = await sendMessage(text);
-      saveState({ rankings: newRanks, messageId });
-      console.log("Rankings updated");
+    if (!oldData || rankingsChanged(oldData, standings)) {
+      const message = formatMessage(standings, gameweek, topScorer);
+      await postToTelegram(message);
+      await saveData(standings);
+      console.log('Posted update');
     } else {
-      console.log("No changes");
+      console.log('No changes');
     }
   } catch (err) {
-    console.error("Error:", err && err.stack ? err.stack : err);
+    console.error(err);
   }
 }
 
-/**
- * Run every 1 hour
- * (Safe for FPL + avoids spam)
- */
-cron.schedule("0 * * * *", checkAndUpdate);
+// Schedule every 30 minutes
+cron.schedule('*/30 * * * *', checkAndPost);
 
-// Run once on startup
-checkAndUpdate();
+// Run immediately on start
+checkAndPost();
